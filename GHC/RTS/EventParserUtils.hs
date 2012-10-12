@@ -10,6 +10,8 @@ module GHC.RTS.EventParserUtils (
         getE,
         getH,
         getString,
+        getByteString,
+        getByteStringNul,
         mkEventTypeParsers,
         simpleEvent,
         skip,
@@ -20,7 +22,7 @@ import Control.Monad.Error
 import Control.Monad.Reader
 import Data.Array
 import Data.Binary
-import Data.Binary.Get hiding (skip)
+import Data.Binary.Get hiding (skip, getByteString)
 import qualified Data.Binary.Get as G
 import Data.Binary.Put
 import Data.Char
@@ -28,6 +30,8 @@ import Data.Function
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
 import Data.List
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
 
 #define EVENTLOG_CONSTANTS_ONLY
 #include "EventLogFormat.h"
@@ -54,6 +58,22 @@ getString :: Integral a => a -> GetEvents String
 getString len = do
     bytes <- nBytes len
     return $ map (chr . fromIntegral) bytes
+
+getByteString :: Integral a => a -> GetEvents BS.ByteString
+getByteString =
+  lift . lift . G.getByteString . fromIntegral
+
+-- | Reads data until the next null byte, returns as a string. The
+-- 'maxSize' parameter can be used to limit the size (length + 1) of
+-- the string. The returned string is lazy as with 'getStringLazy',
+-- but the size is returned seperately.
+getByteStringNul :: (Show a, Integral a) => a -> GetEvents (a, BS.ByteString)
+getByteStringNul maxSize = do
+    bytes <- lift $ lift $ G.getLazyByteStringNul
+    let size = fromIntegral (1 + LBS.length bytes)
+    when (size > maxSize) $
+        throwError ("String not null-terminated properly (" ++ show size ++ " > " ++ show maxSize ++ ")")
+    return (size, BS.concat $ LBS.toChunks bytes)
 
 skip :: Integral a => a -> GetEvents ()
 skip n = lift $ lift $ G.skip (fromIntegral n)
