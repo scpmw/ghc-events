@@ -138,7 +138,7 @@ mkEventTypeParsers etypes event_parsers
                                          best_parser <- case mb_et_size of
                                             Nothing -> getVariableParser possible
                                             Just et_size -> getFixedParser et_size possible
-                                         return $ get_parser best_parser
+                                         return $ wrapParserCheck best_parser
             in case mb_mb_et_size of
                 -- This event is declared in the log file's header
                 Just mb_et_size -> case maybe_parser mb_et_size of
@@ -196,3 +196,25 @@ noEventTypeParser num mb_size = do
              Nothing -> getE :: GetEvents Word16
   skip bytes
   return UnknownEvent{ ref = fromIntegral num }
+
+wrapParserCheck :: EventParser a -> GetEvents a
+wrapParserCheck p@FixedSizeParser{} = do
+  offsetBefore <- lift . lift $ bytesRead
+  result <- fsp_parser p
+  offsetAfter <- lift . lift $ bytesRead
+  when (fsp_type p /= 18) $ -- FIXME
+    when (offsetBefore + fromIntegral (fsp_size p) /= offsetAfter) $
+      fail $ concat ["Internal error: Parser for event type ", show (fsp_type p),
+                     " promised to consume ", show (fsp_size p), " bytes, but only used ",
+                     show (offsetAfter - offsetBefore), "!"]
+  return result
+wrapParserCheck p@VariableSizeParser{} = do
+  expected <- lift . lift $ lookAhead $ getWord16be
+  offsetBefore <- lift . lift $ bytesRead
+  result <- vsp_parser p
+  offsetAfter <- lift . lift $ bytesRead
+  when (offsetBefore + fromIntegral (expected + 2) /= offsetAfter) $
+    fail $ concat ["Internal error: Variable parser for event type ", show (vsp_type p),
+                   " should consume ", show (expected + 2), " bytes, but only used ",
+                   show (offsetAfter - offsetBefore), "!"]
+  return result
