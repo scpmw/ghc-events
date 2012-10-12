@@ -1,4 +1,4 @@
-name:             ghc-events
+name:             ghc-events-pmw
 version:          0.4.0.0
 synopsis:         Library and tool for parsing .eventlog files from GHC
 description:      Parses .eventlog files emitted by GHC 6.12.1 and later.
@@ -27,7 +27,7 @@ source-repository head
 
 library
   build-depends:    base       == 4.*,
-                    mtl        >= 1.1 && < 2.1,
+                    mtl        >= 1.1 && < 2.2,
                     containers >= 0.2 && < 0.6,
                     binary     == 0.5.*,
                     bytestring >= 0.9.0,
@@ -42,7 +42,7 @@ library
                     GHC.RTS.EventTypes
   extensions:	    RecordWildCards, NamedFieldPuns, BangPatterns, PatternGuards
 
-executable ghc-events
+executable ghc-events-pmw
   main-is:          GhcEvents.hs
   build-depends:    base, mtl, containers, binary, bytestring, array
   extensions:	    RecordWildCards, NamedFieldPuns, BangPatterns, PatternGuards
