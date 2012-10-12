@@ -631,7 +631,9 @@ getEventBlock parsers = do
   if b then return [] else do
   mb_e <- getEvent parsers
   case mb_e of
-    Nothing -> return []
+    -- This is almost certainly a data corruption. Just silently
+    -- truncating the block is probably not a good idea.
+    Nothing -> fail "Unexpected data end marker inside block!"
     Just e  -> do
       es <- getEventBlock parsers
       return (e:es)
