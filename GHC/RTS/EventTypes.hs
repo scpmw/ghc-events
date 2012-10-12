@@ -3,6 +3,8 @@
 module GHC.RTS.EventTypes where
 
 import Data.Word (Word16, Word32, Word64)
+import Data.ByteString
+import Data.Array.Unboxed
 
 -- EventType.
 type EventTypeNum = Word16
@@ -25,6 +27,9 @@ type ParConjDynId = Word64
 type ParConjStaticId = StringId
 type SparkId = Word32
 type FutureId = Word64
+
+-- Types for profiling
+type InstrPtr = Word64
 
 sz_event_type_num :: EventTypeSize
 sz_event_type_num = 2
@@ -62,6 +67,10 @@ sz_spark_id :: EventTypeSize
 sz_spark_id = 4
 sz_future_id :: EventTypeSize
 sz_future_id = 8
+
+-- Sizes for profiling
+sz_instrptr :: EventTypeSize
+sz_instrptr = 8
 
 {-
  - Data type delcarations to build the GHC RTS data format,
@@ -273,6 +282,21 @@ data EventInfo
   | MerCapSleeping
   | MerCallingMain
 
+  -- Debugging/Profiling events
+
+  | DebugModule        { package :: !ByteString, file :: !ByteString }
+  | DebugProcedure     { instr :: Maybe Word16, parent :: Maybe Word16, label :: !ByteString }
+  | DebugSource        { sline :: {-# UNPACK #-}!Word16, scol :: {-# UNPACK #-}!Word16
+                       , eline :: {-# UNPACK #-}!Word16, ecol :: {-# UNPACK #-}!Word16
+                       , file :: !ByteString
+                       , name :: !ByteString
+                       }
+  | DebugCore          { coreBind :: !ByteString, coreCons :: !ByteString, coreCode :: ByteString }
+  | DebugPtrRange      { low :: {-# UNPACK #-}!Word64, high :: {-# UNPACK #-}!Word64 }
+  | InstrPtrSample     { cap :: {-# UNPACK #-}!Int,
+                         sample_type :: SampleType,
+                         ips :: !(UArray Word16 Word64) }
+
   deriving Show
 
 --sync with ghc/includes/Constants.h
@@ -298,6 +322,12 @@ data ThreadStopStatus
  | BlockedOnMsgGlobalise
  | BlockedOnBlackHoleOwnedBy {-# UNPACK #-}!ThreadId
  deriving (Show)
+
+data SampleType
+ = SampleByCycle
+ | SampleByHeap
+ deriving (Enum, Eq, Show)
+
 
 mkStopStatus :: RawThreadStopStatus -> ThreadStopStatus
 mkStopStatus n = case n of

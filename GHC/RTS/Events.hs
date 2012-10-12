@@ -13,6 +13,7 @@ module GHC.RTS.Events (
        Event(..),
        EventInfo(..),
        ThreadStopStatus(..),
+       SampleType(..),
        Header(..),
        Data(..),
        CapsetType(..),
@@ -34,7 +35,7 @@ module GHC.RTS.Events (
 
 {- Libraries. -}
 import Data.Binary
-import Data.Binary.Get hiding (skip)
+import Data.Binary.Get hiding (skip, getByteString)
 import qualified Data.Binary.Get as G
 import Data.Binary.Put
 import Control.Monad
@@ -42,13 +43,16 @@ import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
 import Control.Monad.Reader
 import Control.Monad.Error
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as L
+import Data.Char
 import Data.Function
 import Data.List
 import Data.Either
 import Data.Maybe
 import Text.Printf
 import Data.Array
+import qualified Data.Array.Unboxed as UA
 
 import GHC.RTS.EventTypes
 import GHC.RTS.EventParserUtils
@@ -544,6 +548,68 @@ mercuryParsers = [
 
  ]
 
+debugParsers = [
+
+ (VariableSizeParser EVENT_INSTR_PTR_SAMPLE (do -- (type, ips)
+      num <- getE :: GetEvents Word16
+      let cnt = (num - 4) `div` 8
+      cap <- getE :: GetEvents CapNo
+      sample_type <- fmap (toEnum . fromIntegral) (getE :: GetEvents Word16)
+      ips <- replicateM (fromIntegral cnt) getE :: GetEvents [Word64]
+      return InstrPtrSample { cap = fromIntegral cap, sample_type=sample_type
+                            , ips = UA.listArray (1, cnt) ips }
+    )),
+
+ (VariableSizeParser EVENT_DEBUG_MODULE (do -- (package, mod_name)
+      len <- getE :: GetEvents Word16
+      (pkgSize, pkgName) <- getByteStringNul (len - 1)
+      modName <- getByteString (len - pkgSize - 1)
+      skip 1 -- '\0'
+      return $ DebugModule pkgName modName
+    )),
+
+ (VariableSizeParser EVENT_DEBUG_PROCEDURE (do -- (instr, parent, label)
+      len <- getE :: GetEvents Word16
+      instr <- getE :: GetEvents Word16
+      parent <- getE :: GetEvents Word16
+      label <- getByteString (len - 5)
+      skip 1 -- '\0'
+      return $ DebugProcedure {
+        instr = if instr == 0xffff then Nothing else Just instr,
+        parent = if parent == 0xffff then Nothing else Just parent,
+        label = label
+        }
+    )),
+
+ (VariableSizeParser EVENT_DEBUG_SOURCE (do -- (span, file, name)
+      len <- getE :: GetEvents Word16
+      sline <- getE :: GetEvents Word16
+      scol <- getE :: GetEvents Word16
+      eline <- getE :: GetEvents Word16
+      ecol <- getE :: GetEvents Word16
+      (fileSize, file) <- getByteStringNul (len - 8)
+      name <- getByteString (len - 8 - fileSize - 1)
+      skip 1 -- '\0'
+      return $ DebugSource { sline=sline, scol=scol
+                           , eline=eline, ecol=ecol
+                           , file=file, name=name }
+    )),
+
+ (VariableSizeParser EVENT_DEBUG_CORE (do -- (bind, cons, core)
+      len <- getE :: GetEvents Word16
+      (bindSize, bind) <- getByteStringNul (len)
+      (consSize, cons) <- getByteStringNul (len-bindSize)
+      code <- getByteString (len - bindSize - consSize)
+      return $ DebugCore bind cons code
+    )),
+
+ (FixedSizeParser EVENT_DEBUG_PTR_RANGE (sz_instrptr + sz_instrptr) (do -- (low, high)
+      low <- getE :: GetEvents Word64
+      high <- getE :: GetEvents Word64
+      return $ DebugPtrRange low high
+    ))
+ ]
+
 getData :: GetEvents Data
 getData = do
    db <- getE :: GetEvents Marker
@@ -587,7 +653,7 @@ getEventLog = do
         event_parsers = if is_ghc_6
                             then standardParsers ++ ghc6Parsers
                             else standardParsers ++ ghc7Parsers ++
-                                mercuryParsers
+                                mercuryParsers ++ debugParsers
         parsers = mkEventTypeParsers imap event_parsers
     dat <- runReaderT getData (EventParsers parsers)
     return (EventLog header dat)
@@ -799,6 +865,22 @@ showEventInfo spec =
           "Capability going to sleep"
         MerCallingMain ->
           "About to call the program entry point"
+        DebugModule p n ->
+          printf "Debug module %s:%s" (bsToStr p) (bsToStr n)
+        DebugProcedure m_i m_p lbl ->
+          let instr_str = maybe "" (printf " instr %d") m_i
+              parent_str = maybe "" (printf " parent %d") m_p
+          in printf "Debug procedure label %s" (bsToStr lbl) ++ instr_str ++ parent_str
+        DebugSource sl sc el ec file name ->
+          printf "Debug source %s (%s:%d:%d-%d:%d)" (bsToStr name) (bsToStr file) sl sc el ec
+        DebugCore bndr cons _ ->
+          printf "Debug core of %s %s" (bsToStr bndr) (bsToStr cons)
+        DebugPtrRange low high ->
+          printf "Debug pointer range 0x%08x-0x%08x" low high
+        InstrPtrSample cap typ ips ->
+          let ppIps = map (printf "%08x") $ UA.elems ips
+          in printf "Instruction ptr %s cap %d: %s" (show typ) cap (intercalate "," ppIps)
+  where bsToStr = map (chr.fromIntegral) . BS.unpack
 
 showThreadStopStatus :: ThreadStopStatus -> String
 showThreadStopStatus HeapOverflow   = "heap overflow"
@@ -968,6 +1050,12 @@ eventTypeNum e = case e of
     MerReleaseThread _ -> EVENT_MER_RELEASE_CONTEXT
     MerCapSleeping -> EVENT_MER_ENGINE_SLEEPING
     MerCallingMain -> EVENT_MER_CALLING_MAIN
+    InstrPtrSample {} -> EVENT_INSTR_PTR_SAMPLE
+    DebugModule {} -> EVENT_DEBUG_MODULE
+    DebugProcedure {} -> EVENT_DEBUG_PROCEDURE
+    DebugSource {} -> EVENT_DEBUG_SOURCE
+    DebugCore {} -> EVENT_DEBUG_CORE
+    DebugPtrRange {} -> EVENT_DEBUG_PTR_RANGE
 
 putEvent :: Event -> PutEvents ()
 putEvent (Event t spec) = do
@@ -1240,6 +1328,47 @@ putEventSpec (MerReleaseThread thread_id) = do
 
 putEventSpec MerCapSleeping = return ()
 putEventSpec MerCallingMain = return ()
+
+putEventSpec (InstrPtrSample cap sample_type ips) = do
+    putE (sz_cap + 1 + fromIntegral (snd $ UA.bounds ips) * sz_instrptr)
+    -- Note this puts an Int where a Word16 is expected. Yet it was
+    -- (probably) converted from a Word16 anyway, so it should be
+    -- okay. Note this is done at other places as well.
+    putE (fromIntegral (fromEnum sample_type) :: Word8)
+    mapM_ putE $ UA.elems 
+      ips
+putEventSpec (DebugModule pkgName modName) = do
+    putE (fromIntegral (BS.length pkgName + BS.length modName + 2) :: Word16)
+    putE pkgName
+    putE (0 :: Word8)
+    putE modName
+    putE (0 :: Word8)
+putEventSpec (DebugProcedure instr parent label) = do
+    putE (fromIntegral (BS.length label + 1 + 5) :: Word16)
+    putE $ fromMaybe 0xffff instr
+    putE $ fromMaybe 0xffff parent
+    putE label
+    putE (0 :: Word8)
+putEventSpec (DebugSource sline scol eline ecol file name) = do
+    putE (fromIntegral (BS.length file + BS.length name + 2 + 8) :: Word16)
+    putE sline
+    putE scol
+    putE eline
+    putE ecol
+    putE file
+    putE (0 :: Word8)
+    putE name
+    putE (0 :: Word8)
+putEventSpec (DebugCore bind cons core) = do
+    putE (fromIntegral (BS.length bind + BS.length cons + 2 + BS.length core) :: Word16)
+    putE bind
+    putE (0 :: Word8)
+    putE cons
+    putE (0 :: Word8)
+    putE core
+putEventSpec (DebugPtrRange low high) = do
+    putE low
+    putE high
 
 -- [] == []
 -- [x] == x\0

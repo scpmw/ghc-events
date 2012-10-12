@@ -217,6 +217,17 @@
 #define EVENT_MER_ENGINE_SLEEPING       111 /* () */
 #define EVENT_MER_CALLING_MAIN          113 /* () */
 
+/* Range 200 - 210 is hereby reserved for profiling stuff. In hopes that I this
+   is were I can find some peace. */
+
+#define EVENT_DEBUG_MODULE        200
+#define EVENT_DEBUG_PROCEDURE     201
+#define EVENT_DEBUG_SOURCE        202
+#define EVENT_DEBUG_CORE          203
+#define EVENT_DEBUG_PTR_RANGE     204
+
+#define EVENT_INSTR_PTR_SAMPLE    205 /* (ips)                  */
+
 /*
  * Status values for EVENT_STOP_THREAD
  *
