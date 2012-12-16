@@ -226,7 +226,7 @@
 #define EVENT_DEBUG_CORE          203
 #define EVENT_DEBUG_PTR_RANGE     204
 
-#define EVENT_INSTR_PTR_SAMPLE    205 /* (ips)                  */
+#define EVENT_SAMPLES             205
 
 /*
  * Status values for EVENT_STOP_THREAD

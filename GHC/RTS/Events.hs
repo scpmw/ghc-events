@@ -13,7 +13,8 @@ module GHC.RTS.Events (
        Event(..),
        EventInfo(..),
        ThreadStopStatus(..),
-       SampleType(..),
+       SampleVerb(..),
+       SampleNoun(..),
        Header(..),
        Data(..),
        CapsetType(..),
@@ -52,6 +53,7 @@ import Data.Either
 import Data.Maybe
 import Text.Printf
 import Data.Array
+import Data.Bits ((.&.))
 import qualified Data.Array.Unboxed as UA
 
 import GHC.RTS.EventTypes
@@ -114,7 +116,6 @@ getEvent (EventParsers parsers) = do
   if (etRef == EVENT_DATA_END)
      then return Nothing
      else do !ts   <- getE
-             -- trace ("event: " ++ show etRef) $ do
              spec <- parsers ! fromIntegral etRef
              return (Just (Event ts spec))
 
@@ -129,10 +130,11 @@ standardParsers = [
    )),
 
  (FixedSizeParser EVENT_BLOCK_MARKER (sz_block_size + sz_time + sz_cap) (do -- (size, end_time, cap)
+      offset <- lift . lift $ bytesRead
       block_size <- getE :: GetEvents BlockSize
       end_time <- getE :: GetEvents Timestamp
       c <- getE :: GetEvents CapNo
-      lbs <- lift . lift $ getLazyByteString ((fromIntegral block_size) -
+      lbs <- lift $ lift $ getLazyByteString ((fromIntegral block_size) -
                                               (fromIntegral sz_block_event))
       eparsers <- ask
       let e_events = runGet (runErrorT $ runReaderT (getEventBlock eparsers) eparsers) lbs
@@ -550,14 +552,38 @@ mercuryParsers = [
 
 debugParsers = [
 
- (VariableSizeParser EVENT_INSTR_PTR_SAMPLE (do -- (type, ips)
-      num <- getE :: GetEvents Word16
-      let cnt = (num - 4) `div` 8
+ (VariableSizeParser EVENT_SAMPLES (do
+      size <- getE :: GetEvents Word16
+      end <- fmap (+fromIntegral size) . lift  .lift $ bytesRead
       cap <- getE :: GetEvents CapNo
-      sample_type <- fmap (toEnum . fromIntegral) (getE :: GetEvents Word16)
-      ips <- replicateM (fromIntegral cnt) getE :: GetEvents [Word64]
-      return InstrPtrSample { cap = fromIntegral cap, sample_type=sample_type
-                            , ips = UA.listArray (1, cnt) ips }
+      sample_by <- fmap (toEnum . fromIntegral) (getE :: GetEvents Word8)
+      sample_type <- fmap (toEnum . fromIntegral) (getE :: GetEvents Word8)
+      let read last samples = do
+            pos <- lift . lift $ bytesRead
+            if pos >= end then return samples else do
+              typ <- getE :: GetEvents Word8
+              sample <- case typ .&. 0xf0 of
+                0x00 -> fmap ((+last) . fromIntegral) (getE :: GetEvents Word8)
+                0x10 -> fmap (flip subtract last . fromIntegral) (getE :: GetEvents Word8)
+                0x40 -> fmap ((+last) . fromIntegral) (getE :: GetEvents Word32)
+                0x50 -> fmap (flip subtract last . fromIntegral) (getE :: GetEvents Word32)
+                0xf0 -> getE :: GetEvents Word64
+                _    -> fail "Sample: Unknown sample encoding!"
+              weight <- case typ .&. 0x0f of
+                0x00 -> return 1
+                0x01 -> fmap fromIntegral (getE :: GetEvents Word8)
+                0x02 -> fmap fromIntegral (getE :: GetEvents Word16)
+                0x04 -> fmap fromIntegral (getE :: GetEvents Word32)
+                0x08 ->                    getE :: GetEvents Word64
+                _    -> fail "Sample: Unknown weight encoding!"
+              read sample ((sample, weight):samples)
+      results <- read 0 []
+      let len = fromIntegral $ length results
+          !samples = UA.listArray (1,len) $ map fst $ reverse results
+          !weights = UA.listArray (1,len) $ map snd $ reverse results
+      return Samples { cap = fromIntegral cap
+                     , sample_by = sample_by, sample_type=sample_type
+                     , samples = samples, weights = weights }
     )),
 
  (VariableSizeParser EVENT_DEBUG_MODULE (do -- (package, mod_name)
@@ -879,9 +905,9 @@ showEventInfo spec =
           printf "Debug core of %s %s" (bsToStr bndr) (bsToStr cons)
         DebugPtrRange low high ->
           printf "Debug pointer range 0x%08x-0x%08x" low high
-        InstrPtrSample cap typ ips ->
-          let ppIps = map (printf "%08x") $ UA.elems ips
-          in printf "Instruction ptr %s cap %d: %s" (show typ) cap (intercalate "," ppIps)
+        Samples cap typBy typ ips weights ->
+          let ppIps = zipWith (printf "%08x (x%d)") (UA.elems ips) (UA.elems weights)
+          in printf "Sample %s by %s cap %d: %s" (show typ) (show typBy) cap (intercalate "," ppIps)
   where bsToStr = map (chr.fromIntegral) . BS.unpack
 
 showThreadStopStatus :: ThreadStopStatus -> String
@@ -1052,7 +1078,7 @@ eventTypeNum e = case e of
     MerReleaseThread _ -> EVENT_MER_RELEASE_CONTEXT
     MerCapSleeping -> EVENT_MER_ENGINE_SLEEPING
     MerCallingMain -> EVENT_MER_CALLING_MAIN
-    InstrPtrSample {} -> EVENT_INSTR_PTR_SAMPLE
+    Samples {} -> EVENT_SAMPLES
     DebugModule {} -> EVENT_DEBUG_MODULE
     DebugProcedure {} -> EVENT_DEBUG_PROCEDURE
     DebugSource {} -> EVENT_DEBUG_SOURCE
@@ -1331,14 +1357,13 @@ putEventSpec (MerReleaseThread thread_id) = do
 putEventSpec MerCapSleeping = return ()
 putEventSpec MerCallingMain = return ()
 
-putEventSpec (InstrPtrSample cap sample_type ips) = do
+putEventSpec (Samples cap sample_by sample_type ips weights) = do
     putE (sz_cap + 1 + fromIntegral (snd $ UA.bounds ips) * sz_instrptr)
     -- Note this puts an Int where a Word16 is expected. Yet it was
     -- (probably) converted from a Word16 anyway, so it should be
     -- okay. Note this is done at other places as well.
     putE (fromIntegral (fromEnum sample_type) :: Word8)
-    mapM_ putE $ UA.elems 
-      ips
+    mapM_ putE $ UA.elems ips -- TODO!
 putEventSpec (DebugModule pkgName modName) = do
     putE (fromIntegral (BS.length pkgName + BS.length modName + 2) :: Word16)
     putE pkgName

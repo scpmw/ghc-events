@@ -293,9 +293,11 @@ data EventInfo
                        }
   | DebugCore          { coreBind :: !ByteString, coreCons :: !ByteString, coreCode :: ByteString }
   | DebugPtrRange      { low :: {-# UNPACK #-}!Word64, high :: {-# UNPACK #-}!Word64 }
-  | InstrPtrSample     { cap :: {-# UNPACK #-}!Int,
-                         sample_type :: SampleType,
-                         ips :: !(UArray Word16 Word64) }
+  | Samples            { cap :: {-# UNPACK #-}!Int,
+                         sample_by :: !SampleVerb,
+                         sample_type :: !SampleNoun,
+                         samples :: !(UArray Word16 Word64),
+                         weights :: !(UArray Word16 Word64) }
 
   deriving Show
 
@@ -323,11 +325,15 @@ data ThreadStopStatus
  | BlockedOnBlackHoleOwnedBy {-# UNPACK #-}!ThreadId
  deriving (Show)
 
-data SampleType
+data SampleVerb
  = SampleByCycle
  | SampleByHeap
+ | SampleByLifeHeap
  deriving (Enum, Eq, Show)
 
+data SampleNoun
+ = SampleInstrPtr
+ deriving (Enum, Eq, Show)
 
 mkStopStatus :: RawThreadStopStatus -> ThreadStopStatus
 mkStopStatus n = case n of
