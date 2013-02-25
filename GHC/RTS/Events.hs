@@ -39,6 +39,7 @@ import Data.Binary
 import Data.Binary.Get hiding (skip, getByteString)
 import qualified Data.Binary.Get as G
 import Data.Binary.Put
+import Control.Applicative
 import Control.Monad
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
@@ -636,6 +637,14 @@ debugParsers = [
     ))
  ]
 
+taskParsers =
+ [
+ (FixedSizeParser EVENT_TASK_CREATE sz_taskid (CreateTask <$> getE)),
+ (FixedSizeParser EVENT_TASK_START sz_taskid (StartTask <$> getE)),
+ (FixedSizeParser EVENT_TASK_STOP sz_taskid (StopTask <$> getE)),
+ (FixedSizeParser EVENT_TASK_DEPEND (2*sz_taskid) (TaskDependency <$> getE <*> getE))
+ ]
+
 getData :: GetEvents Data
 getData = do
    db <- getE :: GetEvents Marker
@@ -681,7 +690,7 @@ getEventLog = do
         event_parsers = if is_ghc_6
                             then standardParsers ++ ghc6Parsers
                             else standardParsers ++ ghc7Parsers ++
-                                mercuryParsers ++ debugParsers
+                                mercuryParsers ++ debugParsers ++ taskParsers
         parsers = mkEventTypeParsers imap event_parsers
     dat <- runReaderT getData (EventParsers parsers)
     return (EventLog header dat)
@@ -906,8 +915,19 @@ showEventInfo spec =
         DebugPtrRange low high ->
           printf "Debug pointer range 0x%08x-0x%08x" low high
         Samples cap typBy typ ips weights ->
-          let ppIps = zipWith (printf "%08x (x%d)") (UA.elems ips) (UA.elems weights)
-          in printf "Sample %s by %s cap %d: %s" (show typ) (show typBy) cap (intercalate "," ppIps)
+          let ppIps = zipWith (pp) (UA.elems ips) (UA.elems weights)
+              pp ip 1 = printf "%08x" ip
+              pp ip n = printf "%d*%08x" n ip
+          in printf "Sample %s by %s cap %d: %s" (show typ) (show typBy) cap (intercalate ", " ppIps)
+        CreateTask task ->
+          printf "Create task %d" task
+        StartTask task ->
+          printf "Start task %d" task
+        StopTask task ->
+          printf "Stop task %d" task
+        TaskDependency task1 task2 ->
+          printf "Task dependency of %d on %d" task1 task2
+
   where bsToStr = map (chr.fromIntegral) . BS.unpack
 
 showThreadStopStatus :: ThreadStopStatus -> String
@@ -1084,7 +1104,11 @@ eventTypeNum e = case e of
     DebugSource {} -> EVENT_DEBUG_SOURCE
     DebugCore {} -> EVENT_DEBUG_CORE
     DebugPtrRange {} -> EVENT_DEBUG_PTR_RANGE
-
+    CreateTask {} -> EVENT_TASK_CREATE
+    StartTask {} -> EVENT_TASK_START
+    StopTask {} -> EVENT_TASK_STOP
+    TaskDependency {} -> EVENT_TASK_DEPEND
+    
 putEvent :: Event -> PutEvents ()
 putEvent (Event t spec) = do
     putType (eventTypeNum spec)
@@ -1396,6 +1420,16 @@ putEventSpec (DebugCore bind cons core) = do
 putEventSpec (DebugPtrRange low high) = do
     putE low
     putE high
+
+putEventSpec (CreateTask task) = do
+    putE task
+putEventSpec (StartTask task) = do
+    putE task
+putEventSpec (StopTask task) = do
+    putE task
+putEventSpec (TaskDependency task1 task2) = do
+    putE task1
+    putE task2
 
 -- [] == []
 -- [x] == x\0

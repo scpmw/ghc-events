@@ -228,6 +228,11 @@
 
 #define EVENT_SAMPLES             205
 
+#define EVENT_TASK_CREATE         210
+#define EVENT_TASK_START          211
+#define EVENT_TASK_STOP           212
+#define EVENT_TASK_DEPEND         213
+
 /*
  * Status values for EVENT_STOP_THREAD
  *

@@ -72,6 +72,10 @@ sz_future_id = 8
 sz_instrptr :: EventTypeSize
 sz_instrptr = 8
 
+-- Sizes for tasks
+sz_taskid :: EventTypeSize
+sz_taskid = 4
+
 {-
  - Data type delcarations to build the GHC RTS data format,
  - which is a (header, data) pair.
@@ -299,6 +303,11 @@ data EventInfo
                          samples :: !(UArray Word16 Word64),
                          weights :: !(UArray Word16 Word64) }
 
+  | CreateTask         { taskId :: Word32 }
+  | StartTask          { taskId :: Word32 }
+  | StopTask           { taskId :: Word32 }
+  | TaskDependency     { taskId1 :: Word32, taskId2 :: Word32 }
+    
   deriving Show
 
 --sync with ghc/includes/Constants.h
