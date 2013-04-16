@@ -33,16 +33,18 @@ module GHC.RTS.Events (
   ) where
 
 {- Libraries. -}
-import Data.Word (Word16, Word32, Word64)
-import Data.Binary
-import Data.Binary.Get
-import Data.Binary.Put
+import Data.Word (Word16, Word32, Word64, Word8)
+import Data.Attoparsec as P
 import Control.Monad
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
+import Data.Map (Map)
+import qualified Data.Map as Map
+import Data.Binary (Binary, put)
+import Data.Binary.Put
 import Control.Monad.Reader
-import Control.Monad.Error
 import qualified Data.ByteString.Lazy as L
+import qualified Data.ByteString as S
 import Data.Char
 import Data.Function
 import Data.List
@@ -50,12 +52,16 @@ import Data.Either
 import Data.Maybe
 import Text.Printf
 import Data.Array
+import Numeric (showHex)
+
+import Data.Bits
+
+import System.IO
 
 #define EVENTLOG_CONSTANTS_ONLY
 #include "EventLogFormat.h"
 
 {- Type synonyms. -}
-type Filename = String
 
 -- EventType.
 type EventTypeNum = Word16
@@ -63,12 +69,12 @@ type EventTypeDescLen = Word32
 type EventTypeDesc = String
 type EventTypeSize = Word16
 -- Event.
-type EventDescription = String
 type Timestamp = Word64
 type ThreadId = Word32
 type CapNo = Word16
 type Marker = Word32
 
+sz_cap, sz_time, sz_tid, sz_old_tid, sz_capset, sz_capset_type :: EventTypeSize
 sz_cap  = 2
 sz_time = 8
 sz_tid  = 4
@@ -176,7 +182,14 @@ data EventTypeSpecificInfo
                        }
   | Message            { msg :: String }
   | UserMessage        { msg :: String }
+  | HpcModule          { modName :: String, modCount :: Word32, modHash :: Word32, modBase :: Word32 }
+  | TickDump           { cap :: {-# UNPACK #-}!Int,
+                         dump :: [(Word32, Word32)] }
+  | InstrPtrSample     { cap :: {-# UNPACK #-}!Int,
+                         ips :: [Word32] }
+  | Blackhole          { ip :: Word32 }
   | UnknownEvent       { ref  :: {-# UNPACK #-}!EventTypeNum }
+  | ErrorEvent         { errorMsg :: String }
 
   deriving Show
 
@@ -246,57 +259,89 @@ mkCapsetType n = case n of
  _ -> CapsetUnknown
 
 -- reader/Get monad that passes around the event types
-type GetEvents a = ReaderT EventParsers (ErrorT String Get) a
-  
-newtype EventParsers = EventParsers (Array Int (GetEvents EventTypeSpecificInfo))
+type GetEvents a = ReaderT EventParsers Parser a
 
-type GetHeader a = ErrorT String Get a
+newtype EventParsers = EventParsers (Array Int (Maybe EventType, GetEvents EventTypeSpecificInfo))
 
-getH :: Binary a => GetHeader a
-getH = lift get
+type GetHeader a = Parser a
 
-getE :: Binary a => GetEvents a
-getE = lift $ lift get
+class Parseable a where
+  getH :: Parser a
+
+instance Parseable Word8 where
+  getH = anyWord8
+instance Parseable Word16 where
+  getH = do b1 <- anyWord8
+            b2 <- anyWord8
+            return ((fromIntegral b1 `shift` 8) .|.
+                    (fromIntegral b2))
+instance Parseable Word32 where
+  getH = do b1 <- anyWord8
+            b2 <- anyWord8
+            b3 <- anyWord8
+            b4 <- anyWord8
+            return ((fromIntegral b1 `shift` 24) .|.
+                    (fromIntegral b2 `shift` 16) .|.
+                    (fromIntegral b3 `shift` 8) .|.
+                    (fromIntegral b4))
+instance Parseable Word64 where
+  getH = do b1 <- anyWord8
+            b2 <- anyWord8
+            b3 <- anyWord8
+            b4 <- anyWord8
+            b5 <- anyWord8
+            b6 <- anyWord8
+            b7 <- anyWord8
+            b8 <- anyWord8
+            return ((fromIntegral b1 `shift` 56) .|.
+                    (fromIntegral b2 `shift` 48) .|.
+                    (fromIntegral b3 `shift` 40) .|.
+                    (fromIntegral b4 `shift` 32) .|.
+                    (fromIntegral b5 `shift` 24) .|.
+                    (fromIntegral b6 `shift` 16) .|.
+                    (fromIntegral b7 `shift` 8) .|.
+                    (fromIntegral b8))
+
+getE :: Parseable a => GetEvents a
+getE = lift getH
+{-# INLINE getE #-}
 
 ------------------------------------------------------------------------------
 -- Binary instances
 
 getEventType :: GetHeader EventType
-getEventType = do 
+getEventType = do
            etNum <- getH
-           size <- getH :: GetHeader EventTypeSize
-           let etSize = if size == 0xffff then Nothing else Just size
+           s <- getH :: GetHeader EventTypeSize
+           let etSize = if s == 0xffff then Nothing else Just s
            -- 0xffff indicates variable-sized event
            etDescLen <- getH :: GetHeader EventTypeDescLen
-           etDesc <- getEtDesc (fromIntegral etDescLen) 
+           etDesc <- fmap (map (chr . fromIntegral) . S.unpack) $ P.take (fromIntegral etDescLen) 
            etExtraLen <- getH :: GetHeader Word32
-           _skip  <- replicateM_ (fromIntegral etExtraLen) (lift getWord8)
+           _ <- P.take (fromIntegral etExtraLen)
            ete <- getH :: GetHeader Marker
            when (ete /= EVENT_ET_END) $
-              throwError ("Event Type end marker not found.")
+              fail ("Event Type end marker not found.")
            return (EventType etNum etDesc etSize)
-           where 
-             getEtDesc :: Int -> GetHeader [Char]
-             getEtDesc s = replicateM s (getH :: GetHeader Char)
 
 getHeader :: GetHeader Header
-getHeader = do 
+getHeader = do
            hdrb <- getH :: GetHeader Marker
            when (hdrb /= EVENT_HEADER_BEGIN) $
-                throwError "Header begin marker not found"
+                fail "Header begin marker not found"
            hetm <- getH :: GetHeader Marker
            when (hetm /= EVENT_HET_BEGIN) $ 
-                throwError "Header Event Type begin marker not found"
+                fail "Header Event Type begin marker not found"
            ets <- getEventTypes
            emark <- getH :: GetHeader Marker
            when (emark /= EVENT_HEADER_END) $
-                throwError "Header end marker not found"
+                fail "Header end marker not found"
            return (Header ets)
-     where    
+     where
        getEventTypes :: GetHeader [EventType]
        getEventTypes = do
            m <- getH :: GetHeader Marker
-           case () of 
+           case () of
             _ | m == EVENT_ET_BEGIN -> do
                    et <- getEventType
                    nextET <- getEventTypes
@@ -304,17 +349,16 @@ getHeader = do
               | m == EVENT_HET_END ->
                    return []
               | otherwise ->
-                   throwError "Malformed list of Event Types in header"
+                   fail "Malformed list of Event Types in header"
 
-getEvent :: EventParsers -> GetEvents (Maybe Event)
-getEvent (EventParsers parsers) = do 
+getEvent :: GetEvents Event
+getEvent = do
+  EventParsers parsers <- ask
   etRef <- getE :: GetEvents EventTypeNum
-  if (etRef == EVENT_DATA_END) 
-     then return Nothing
-     else do !ts   <- getE
-             -- trace ("event: " ++ show etRef) $ do
-             spec <- parsers ! fromIntegral etRef
-             return (Just (Event ts spec))
+  guard $ inRange (bounds parsers) (fromIntegral etRef)
+  !ts   <- getE
+  spec <- snd $ parsers ! fromIntegral etRef
+  return (Event ts spec)
 
 -- Our event log format allows new fields to be added to events over
 -- time.  This means that our parser must be able to handle:
@@ -326,7 +370,7 @@ getEvent (EventParsers parsers) = do
 -- select the correct parser for the event type based on its size.  We
 -- do this once after parsing the header: given the EventTypes, we build 
 -- an array of event parsers indexed by event type.
--- 
+--
 -- For each event type, we may have multiple parsers for different
 -- versions of the event, indexed by size.  These are listed in the
 -- eventTypeParsers list below.  For the given log file we select the
@@ -344,24 +388,24 @@ getEvent (EventParsers parsers) = do
 --     parse the bits we understand and discard the rest
 
 mkEventTypeParsers :: IntMap EventType
-                   -> Array Int (GetEvents EventTypeSpecificInfo)
-mkEventTypeParsers etypes 
+                   -> Array Int (Maybe EventType, GetEvents EventTypeSpecificInfo)
+mkEventTypeParsers etypes
  = accumArray (flip const) undefined (0, max_event_num)
-    ([ (num, undeclared_etype num) | num <- [0..max_event_num] ] ++
-     [ (num, parser num etype) | (num, etype) <- M.toList etypes ])
+    ([ (num, (Nothing, undeclared_etype num)) | num <- [0..max_event_num] ] ++
+     [ (num, (Just etype, parser num etype)) | (num, etype) <- M.toList etypes ])
   where
     max_event_num = maximum (M.keys etypes)
-    undeclared_etype num = throwError ("undeclared event type: " ++ show num)
+    undeclared_etype num = fail ("undeclared event type: " ++ show num)
 
     parser num etype =
          let
-             possible
-               | not (inRange (bounds eventTypeParsers) num) = []
-               | otherwise = eventTypeParsers ! num
+             possible = case Map.lookup (desc etype) eventTypeParsers of
+               Nothing -> []
+               Just ps -> ps
              mb_et_size = size etype
          in
          case mb_et_size of
-           Nothing -> case M.lookup num variableEventTypeParsers of
+           Nothing -> case Map.lookup (desc etype) variableEventTypeParsers of
                         Nothing -> noEventTypeParser num mb_et_size
                         Just p  -> p
 
@@ -396,49 +440,46 @@ mkEventTypeParsers etypes
                      in  if sz == et_size
                             then best
                             else do r <- best
-                                    lift . lift $ 
-                                      replicateM_ (fromIntegral (et_size - sz))
-                                                getWord8
+                                    _ <- lift $ P.take (fromIntegral (et_size - sz))
                                     return r
 
 
-eventTypeParsers :: Array Int [(EventTypeSize, GetEvents EventTypeSpecificInfo)]
-eventTypeParsers = accumArray (flip (:)) [] (0,NUM_EVENT_TAGS) [
-
- (EVENT_STARTUP, 
+eventTypeParsers :: Map String [(EventTypeSize, GetEvents EventTypeSpecificInfo)]
+eventTypeParsers = foldl (\t (k, v) -> Map.insertWith' (++) k [v] t) Map.empty [
+ ("Startup",
   (sz_cap, do -- (n_caps)
       c <- getE :: GetEvents CapNo
       return Startup{ n_caps = fromIntegral c }
    )),
 
- (EVENT_BLOCK_MARKER,
+ ("Block marker",
   (4 + sz_time + sz_cap, do -- (size, end_time, cap)
       block_size <- getE :: GetEvents Word32
       end_time <- getE :: GetEvents Timestamp
       c <- getE :: GetEvents CapNo
-      lbs <- lift . lift $ getLazyByteString (fromIntegral block_size - 24)
-      eparsers <- ask
-      let e_events = runGet (runErrorT $ runReaderT (getEventBlock eparsers) eparsers) lbs
-      return EventBlock{ end_time=end_time,
-                         cap= fromIntegral c, 
-                         block_events=case e_events of
-                                        Left s -> error s
-                                        Right es -> es }
+      block <- lift $ P.take $ fromIntegral block_size - 24
+      e <- ask
+      let parseEvents = flip runReaderT e $ getEvents end_time []
+      return $! case parseOnly parseEvents block of
+        Left err  -> ErrorEvent $ "Faulty event block: " ++ err
+        Right evs -> EventBlock { end_time = end_time,
+                                  cap = fromIntegral c,
+                                  block_events = evs }
    )),
 
- (EVENT_CREATE_THREAD,
+ ("Create thread",
   (sz_tid, do  -- (thread)
       t <- getE
       return CreateThread{thread=t}
    )),
 
- (EVENT_RUN_THREAD,
+ ("Run thread",
   (sz_tid, do  --  (thread)
       t <- getE
       return RunThread{thread=t}
    )),
 
- (EVENT_STOP_THREAD,
+ ("Stop thread",
   (sz_tid + 2, do  -- (thread, status)
       t <- getE
       s <- getE :: GetEvents Word16
@@ -448,7 +489,7 @@ eventTypeParsers = accumArray (flip (:)) [] (0,NUM_EVENT_TAGS) [
                                               else mkStat stat}
    )),
 
- (EVENT_STOP_THREAD,
+ ("Stop thread",
   (sz_tid + 2 + sz_tid, do  -- (thread, status, info)
       t <- getE
       s <- getE :: GetEvents Word16
@@ -464,80 +505,81 @@ eventTypeParsers = accumArray (flip (:)) [] (0,NUM_EVENT_TAGS) [
                                     -> mkStat stat}
    )),
 
- (EVENT_THREAD_RUNNABLE,
+ ("Thread runnable",
   (sz_tid, do  -- (thread)
       t <- getE
       return ThreadRunnable{thread=t}
    )),
 
- (EVENT_MIGRATE_THREAD,
+ ("Migrate thread",
   (sz_tid + sz_cap, do  --  (thread, newCap)
       t  <- getE
       nc <- getE :: GetEvents CapNo
       return MigrateThread{thread=t,newCap=fromIntegral nc}
    )),
 
- (EVENT_RUN_SPARK,
+ ("Run spark",
   (sz_tid, do  -- (thread)
       t <- getE
       return RunSpark{thread=t}
    )),
 
- (EVENT_STEAL_SPARK,
+ ("Steal spark",
   (sz_tid + sz_cap, do  -- (thread, victimCap)
       t  <- getE
       vc <- getE :: GetEvents CapNo
       return StealSpark{thread=t,victimCap=fromIntegral vc}
    )),
 
- (EVENT_CREATE_SPARK_THREAD,
+ ("Create spark thread",
   (sz_tid, do  -- (sparkThread)
       st <- getE :: GetEvents ThreadId
       return CreateSparkThread{sparkThread=st}
    )),
 
- (EVENT_SHUTDOWN, (0, return Shutdown)),
+ ("Shutdown", (0, return Shutdown)),
 
- (EVENT_THREAD_WAKEUP,
+ ("Wakeup thread",
   (sz_tid + sz_cap, do  -- (thread, other_cap)
       t <- getE
       oc <- getE :: GetEvents CapNo
       return WakeupThread{thread=t,otherCap=fromIntegral oc}
    )),
 
- (EVENT_REQUEST_SEQ_GC, (0, return RequestSeqGC)),
+ ("Request sequential GC", (0, return RequestSeqGC)),
 
- (EVENT_REQUEST_PAR_GC, (0, return RequestParGC)),
+ ("Request parallel GC", (0, return RequestParGC)),
 
- (EVENT_GC_START, (0, return StartGC)),
+ ("Starting GC", (0, return StartGC)),
 
- (EVENT_GC_WORK, (0, return GCWork)),
+ ("GC working", (0, return GCWork)),
 
- (EVENT_GC_IDLE, (0, return GCIdle)),
+ ("GC idle", (0, return GCIdle)),
 
- (EVENT_GC_DONE, (0, return GCDone)),
+ ("GC done", (0, return GCDone)),
 
- (EVENT_GC_END, (0, return EndGC)),
+ ("Finished GC", (0, return EndGC)),
+ ("Blackhole", (4, liftM Blackhole getE)),
 
  -----------------------
  -- GHC 6.12 compat: GHC 6.12 reported the wrong sizes for some events,
  -- so we have to recognise those wrong sizes here for backwards 
  -- compatibility.
 
- (EVENT_STARTUP, 
+ ("Startup",
   (0, do -- BUG in GHC 6.12: the startup event was incorrectly 
          -- declared as size 0, so we accept it here.
       c <- getE :: GetEvents CapNo
       return Startup{ n_caps = fromIntegral c }
    )),
 
- (EVENT_CREATE_THREAD,
+ ("Create thread",
   (sz_old_tid, do  -- (thread)
       t <- getE
       return CreateThread{thread=t}
    )),
 
- (EVENT_RUN_THREAD,
+ ("Run thread",
   (sz_old_tid, do  --  (thread)
       t <- getE
       return RunThread{thread=t}
@@ -556,74 +598,74 @@ eventTypeParsers = accumArray (flip (:)) [] (0,NUM_EVENT_TAGS) [
    )),
  -}
 
- (EVENT_THREAD_RUNNABLE,
+ ("Thread runnable",
   (sz_old_tid, do  -- (thread)
       t <- getE
       return ThreadRunnable{thread=t}
    )),
 
- (EVENT_MIGRATE_THREAD,
+ ("Migrate thread",
   (sz_old_tid + sz_cap, do  --  (thread, newCap)
       t  <- getE
       nc <- getE :: GetEvents CapNo
       return MigrateThread{thread=t,newCap=fromIntegral nc}
    )),
 
- (EVENT_RUN_SPARK,
+ ("Run spark",
   (sz_old_tid, do  -- (thread)
       t <- getE
       return RunSpark{thread=t}
    )),
 
- (EVENT_STEAL_SPARK,
+ ("Steal spark",
   (sz_old_tid + sz_cap, do  -- (thread, victimCap)
       t  <- getE
       vc <- getE :: GetEvents CapNo
       return StealSpark{thread=t,victimCap=fromIntegral vc}
    )),
 
- (EVENT_CREATE_SPARK_THREAD,
+ ("Create spark thread",
   (sz_old_tid, do  -- (sparkThread)
       st <- getE :: GetEvents ThreadId
       return CreateSparkThread{sparkThread=st}
    )),
 
- (EVENT_THREAD_WAKEUP,
+ ("Wakeup thread",
   (sz_old_tid + sz_cap, do  -- (thread, other_cap)
       t <- getE
       oc <- getE :: GetEvents CapNo
       return WakeupThread{thread=t,otherCap=fromIntegral oc}
    )),
- (EVENT_CAPSET_CREATE,
+ ("EVENT_CAPSET_CREATE", -- TODO
   (sz_capset + sz_capset_type, do -- (capset, capset_type)
       cs <- getE
       ct <- fmap mkCapsetType getE
       return CapsetCreate{capset=cs,capsetType=ct}
    )),
- (EVENT_CAPSET_DELETE,
+ ("EVENT_CAPSET_DELETE", -- TODO
   (sz_capset, do -- (capset)
       cs <- getE
       return CapsetDelete{capset=cs}
    )),
- (EVENT_CAPSET_ASSIGN_CAP,
+ ("EVENT_CAPSET_ASSIGN_CAP", -- TODO
   (sz_capset + sz_cap, do -- (capset, cap)
       cs <- getE
       cp <- getE :: GetEvents CapNo
       return CapsetAssignCap{capset=cs,cap=fromIntegral cp}
    )),
- (EVENT_CAPSET_REMOVE_CAP,
+ ("EVENT_CAPSET_REMOVE_CAP", -- TODO
   (sz_capset + sz_cap, do -- (capset, cap)
       cs <- getE
       cp <- getE :: GetEvents CapNo
       return CapsetRemoveCap{capset=cs,cap=fromIntegral cp}
    )),
- (EVENT_OSPROCESS_PID,
+ ("EVENT_OSPROCESS_PID", -- TODO
   (sz_capset + 4, do -- (capset, pid)
       cs <- getE
       pd <- getE
       return OsProcessPid{capset=cs,pid=pd}
    )),
- (EVENT_OSPROCESS_PPID,
+ ("EVENT_OSPROCESS_PPID", -- TODO
   (sz_capset + 4, do -- (capset, ppid)
       cs <- getE
       pd <- getE
@@ -631,41 +673,75 @@ eventTypeParsers = accumArray (flip (:)) [] (0,NUM_EVENT_TAGS) [
   ))
  ]
 
-variableEventTypeParsers :: IntMap (GetEvents EventTypeSpecificInfo)
-variableEventTypeParsers = M.fromList [
+variableEventTypeParsers :: Map String (GetEvents EventTypeSpecificInfo)
+variableEventTypeParsers = Map.fromList [
 
- (EVENT_LOG_MSG, do -- (msg)
+ ("Log message", do -- (msg)
       num <- getE :: GetEvents Word16
-      bytes <- replicateM (fromIntegral num) getE 
-      return Message{ msg = bytesToString bytes }
+      bytes <- lift $ P.take $ fromIntegral num
+      return Message{ msg = map (chr . fromIntegral) $ S.unpack bytes }
    ),
 
- (EVENT_USER_MSG, do -- (msg)
+ ("User message", do -- (msg)
       num <- getE :: GetEvents Word16
       bytes <- replicateM (fromIntegral num) getE 
       return UserMessage{ msg = bytesToString bytes }
    ),
- (EVENT_PROGRAM_ARGS, do -- (capset, [arg])
+ ("EVENT_PROGRAM_ARGS", do -- (capset, [arg]) -- TODO!
       num <- getE :: GetEvents Word16
       cs <- getE
       bytes <- replicateM (fromIntegral num - 4) getE
       return ProgramArgs{ capset = cs
                         , args = splitNull $ bytesToString bytes }
    ),
- (EVENT_PROGRAM_ENV, do -- (capset, [arg])
+ ("EVENT_PROGRAM_ENV", do -- (capset, [arg]) -- TODO!
       num <- getE :: GetEvents Word16
       cs <- getE
       bytes <- replicateM (fromIntegral num - 4) getE
       return ProgramEnv{ capset = cs
                        , env = splitNull $ bytesToString bytes }
    ),
- (EVENT_RTS_IDENTIFIER, do -- (capset, str)
+ ("EVENT_RTS_IDENTIFIER", do -- (capset, str) -- TODO!
       num <- getE :: GetEvents Word16
       cs <- getE
       bytes <- replicateM (fromIntegral num - 4) getE
       return RtsIdentifier{ capset = cs
                           , rtsident = bytesToString bytes }
-   )
+   ),
+ 
+ ("HPC module", do
+     num <- getE :: GetEvents Word16
+     let len = (num - 12)
+     bytes <- replicateM (fromIntegral len) getE :: GetEvents [Word8]
+     modCount <- getE :: GetEvents Word32
+     modHash <- getE :: GetEvents Word32
+     modBase <- getE :: GetEvents Word32
+     return HpcModule { modName = map (chr . fromIntegral) bytes
+                      , modCount = modCount
+                      , modHash = modHash
+                      , modBase = modBase
+                      }
+ ),
+ 
+ ("Tick dump", do
+     num <- getE :: GetEvents Word16
+     let cnt = (num - 2) `div` 8
+     cap <- getE :: GetEvents CapNo
+     dump <- replicateM (fromIntegral cnt) $ do
+       tick <- getE :: GetEvents Word32
+       freq <- getE :: GetEvents Word32
+       return (tick, freq)
+     return TickDump { cap=fromIntegral cap, dump=dump }
+ ),
+ 
+ ("Instruction pointer sample", do
+     num <- getE :: GetEvents Word16
+     let cnt = (num - 2) `div` 4
+     cap <- getE :: GetEvents CapNo
+     ips <- replicateM (fromIntegral cnt) getE :: GetEvents [Word32]
+     return InstrPtrSample { cap = fromIntegral cap, ips = ips }
+ )
+ 
  ]
  where
     bytesToString :: [Word8] -> String
@@ -682,7 +758,7 @@ noEventTypeParser num mb_size = do
   bytes <- case mb_size of
              Just n  -> return n
              Nothing -> getE :: GetEvents Word16
-  skip  <- lift . lift $ replicateM_ (fromIntegral bytes) getWord8
+  _ <- lift $ P.take (fromIntegral bytes)
   return UnknownEvent{ ref = fromIntegral num }
 
 
@@ -690,30 +766,39 @@ noEventTypeParser num mb_size = do
 getData :: GetEvents Data
 getData = do
    db <- getE :: GetEvents Marker
-   when (db /= EVENT_DATA_BEGIN) $ throwError "Data begin marker not found"
-   eparsers <- ask
-   let 
-       getEvents :: [Event] -> GetEvents Data
-       getEvents events = do
-         mb_e <- getEvent eparsers
-         case mb_e of
-           Nothing -> return (Data (reverse events))
-           Just e  -> getEvents (e:events)
-   -- in
-   getEvents []
+   when (db /= EVENT_DATA_BEGIN) $ fail "Data begin marker not found"
+   return . Data =<< getEvents 0 []
 
-getEventBlock :: EventParsers -> GetEvents [Event]
-getEventBlock parsers = do
-  b <- lift . lift $ isEmpty
-  if b then return [] else do
-  mb_e <- getEvent parsers
-  case mb_e of
-    Nothing -> return []
-    Just e  -> do
-      es <- getEventBlock parsers
-      return (e:es)
+getEvents :: Timestamp -> [Event] -> GetEvents [Event]
+getEvents t evs =
+  join $ msum
+    [ -- Check for end of file or end of data marker
+      do lift endOfInput
+         return $ return $ reverse evs
+    , do e <- (getE :: GetEvents EventTypeNum)
+         guard $ e == EVENT_DATA_END
+         return $ return $ reverse evs
+      -- Try to parse event
+    , do e <- getEvent
+         return $ getEvents (time e) (e:evs)
+      -- If failed, try to recover by skipping the number of bytes
+      -- given in the header.
+    , do etRef <- getE :: GetEvents EventTypeNum
+         EventParsers parsers <- ask
+         guard $ inRange (bounds parsers) (fromIntegral etRef)
+         let Just evTy = fst $ parsers ! fromIntegral etRef 
+         case size evTy of
+           Just n  -> lift (P.take $ fromIntegral n) >> return ()
+           Nothing -> do n <- getE :: GetEvents Word16
+                         lift $ P.take (fromIntegral n) >> return ()
+         let e = Event t $ ErrorEvent $ "Failed to parse event " ++ desc evTy ++ "!"
+         return $ getEvents t (e:evs)
+      -- Finally, fail completely
+    , do let e = Event t $ ErrorEvent "Failed to parse event - unknown event or data missing."
+         return $ return $ reverse (e:evs)
+    ]
 
-getEventLog :: ErrorT String Get EventLog
+getEventLog :: Parser EventLog
 getEventLog = do
     header <- getHeader
     let imap = M.fromList [ (fromIntegral (num t),t) | t <- eventTypes header]
@@ -723,16 +808,34 @@ getEventLog = do
 
 readEventLogFromFile :: FilePath -> IO (Either String EventLog)
 readEventLogFromFile f = do
-    s <- L.readFile f
-    return $ runGet (do v <- runErrorT $ getEventLog
-                        m <- isEmpty
-                        m `seq` return v)  s
+    h <- openFile f ReadMode
+    empty <- hIsEOF h
+    if empty
+      then return (Left "File is empty!")
+      else continueEventLogFromHandle h $ parse getEventLog S.empty
+
+continueEventLogFromHandle :: Handle -> Result EventLog -> IO (Either String EventLog)
+continueEventLogFromHandle h res = do
+  -- Read a chunk
+  eof <- hIsEOF h
+  bs <- if eof then return S.empty
+               else S.hGetSome h 1024
+  -- Feed to Attoparsec
+  case feed res bs of
+    Fail rest ctx err -> do
+      pos <- hTell h
+      let restLen = fromIntegral $ S.length rest
+      return $ Left $ "Error at " ++ show (pos - restLen) ++ ": " ++ err ++ show ctx
+    r'@Partial{}
+      | eof      -> return $ Left $ "Internal error: Parser did not finish!" -- should not happen
+      | not eof  -> continueEventLogFromHandle h r'
+    Done _ res   -> return $ Right res
 
 -- -----------------------------------------------------------------------------
 -- Utilities
 
 -- | An event annotated with the Capability that generated it, if any
-data CapEvent 
+data CapEvent
   = CapEvent { ce_cap   :: Maybe Int,
                ce_event :: Event
                -- we could UNPACK ce_event, but the Event constructor
@@ -747,10 +850,10 @@ sortEvents = sortGroups . groupEvents
 -- capability that generated it.
 sortGroups :: [(Maybe Int, [Event])] -> [CapEvent]
 sortGroups groups = mergesort' (compare `on` (time . ce_event)) $
-                      [ [ CapEvent cap e | e <- es ] 
+                      [ [ CapEvent cap e | e <- es ]
                       | (cap, es) <- groups ]
      -- sorting is made much faster by the way that the event stream is
-     -- divided into blocks of events.  
+     -- divided into blocks of events.
      --  - All events in a block belong to a particular capability
      --  - The events in a block are ordered by time
      --  - blocks for the same capability appear in time order in the event
@@ -761,7 +864,7 @@ sortGroups groups = mergesort' (compare `on` (time . ce_event)) $
      -- merge the resulting lists.
 
 groupEvents :: [Event] -> [(Maybe Int, [Event])]
-groupEvents es = (Nothing, n_events) : 
+groupEvents es = (Nothing, n_events) :
                  [ (Just (cap (head blocks)), concatMap block_events blocks)
                  | blocks <- groups ]
   where
@@ -868,11 +971,22 @@ showEventTypeSpecificInfo spec =
         ProgramArgs cs args ->
           printf "capset %d: args: %s" cs (show args)
         ProgramEnv cs env ->
-          printf "capset %d: env: %s" cs (show env)
+          printf "capset %d, env: %s" cs (show env)
+        HpcModule name boxes _ base ->
+          printf "HPC module %s with %d tick boxes, iticks starting at %d" name boxes base
+        TickDump cap dump ->
+          printf "Tick dump cap %d: %s" cap (show $ sortBy (compare `on` fst) dump)
+        InstrPtrSample cap ips ->
+          printf "Instruction ptr sample cap %d: %s" cap (intercalate "," (map (flip showHex "") ips))
+        Blackhole ip ->
+          printf "Blackhole %s" (showHex ip "")
         UnknownEvent _ ->
           "Unknown event type"
+        ErrorEvent msg ->
+          "Error in stream: " ++ msg
 
 showThreadStopStatus :: ThreadStopStatus -> String
+showThreadStopStatus NoStatus       = "no status"
 showThreadStopStatus HeapOverflow   = "heap overflow"
 showThreadStopStatus StackOverflow  = "stack overflow"
 showThreadStopStatus ThreadYielding = "thread yielding"
